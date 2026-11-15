@@ -22,13 +22,16 @@ import android.widget.Toast;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 1) Skryje kartu Reels (Instagram) / Shorts (YouTube).
  *    Android 14+: spodnú lištu nakreslí nanovo bez tej karty, ostatné ikony rovnomerne rozložené.
  *    Starší Android: kartu prekryje obdĺžnikom vo farbe lišty.
+ *    Keď sa na kartu dostaneš inak (napr. swipnutím), hneď ťa vráti na Domov.
  * 2) Keď sa otvorí reel/short (napr. poslaný v správe) a skúsiš posunúť na ďalší,
  *    prehrávač sa zavrie (krok späť).
  */
@@ -47,16 +50,21 @@ public class BlockerService extends AccessibilityService {
     private BarView overlay;
     private WindowManager.LayoutParams overlayLp;
     private boolean updateScheduled;
-    private long lastTabBack;
     private final Map<String, Integer> sampledColors = new HashMap<>();
     private final Map<String, Long> sampledAt = new HashMap<>();
     private long lastScreenshot;
+
+    // --- odchod z karty Reels/Shorts ---
+    private final Set<String> sawSelection = new HashSet<>();
+    private long reelsSince;
+    private long lastLeave;
 
     // --- prekreslená lišta (Android 14+) ---
     private List<AccessibilityNodeInfo> barTargets = Collections.emptyList();
     private Bitmap barBitmap;
     private String barBitmapKey;
     private String lastBarKey;
+    private final Map<String, Integer> barColors = new HashMap<>();
     private long lastCapture;
     private boolean captureInFlight;
     private boolean capturePending;
@@ -76,7 +84,7 @@ public class BlockerService extends AccessibilityService {
         running = true;
         prefs = Prefs.get(this);
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-        DiagLog.add("Služba spustená (Android " + Build.VERSION.SDK_INT + ")");
+        DiagLog.add("Služba spustená (Android API " + Build.VERSION.SDK_INT + ")");
     }
 
     @Override
@@ -179,22 +187,24 @@ public class BlockerService extends AccessibilityService {
 
     private void updateOverlay() {
         AccessibilityNodeInfo tab = null;
+        AccessibilityNodeInfo root = null;
         AccessibilityWindowInfo win = null;
         String pkg = null;
         try {
             for (AccessibilityWindowInfo w : getWindows()) {
                 if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
-                AccessibilityNodeInfo root = w.getRoot();
-                if (root == null || root.getPackageName() == null) continue;
-                String p = root.getPackageName().toString();
+                AccessibilityNodeInfo r = w.getRoot();
+                if (r == null || r.getPackageName() == null) continue;
+                String p = r.getPackageName().toString();
                 if (IG.equals(p) && Prefs.on(prefs, Prefs.IG_TAB)) {
-                    tab = findIgTab(root);
+                    tab = findIgTab(r);
                 } else if (YT.equals(p) && Prefs.on(prefs, Prefs.YT_TAB)) {
-                    tab = findYtTab(root);
+                    tab = findYtTab(r);
                 }
                 if (tab != null) {
                     pkg = p;
                     win = w;
+                    root = r;
                     break;
                 }
             }
@@ -204,6 +214,7 @@ public class BlockerService extends AccessibilityService {
 
         if (tab == null) {
             diagTab("karta nenájdená");
+            reelsSince = 0;
             hideOverlay();
             return;
         }
@@ -214,41 +225,82 @@ public class BlockerService extends AccessibilityService {
             return;
         }
 
-        // Poistka: ak by sa karta predsa nejako otvorila, vrátime sa späť.
-        if (tab.isSelected()) {
-            long now = SystemClock.uptimeMillis();
-            if (now - lastTabBack > 1500) {
-                lastTabBack = now;
-                performGlobalAction(GLOBAL_ACTION_BACK);
-                DiagLog.add("BLOK: karta bola otvorená -> späť");
-            }
-        }
-
-        Bar bar = Build.VERSION.SDK_INT >= 34 ? findBar(tab) : null;
+        Bar bar = findBar(tab, tabRect);
+        boolean tabSelected = selectedIn(tab, 2);
         diagTab("karta " + shortPkg(pkg) + " id=" + tab.getViewIdResourceName()
                 + " desc=" + tab.getContentDescription() + " " + tabRect.toShortString()
+                + " vybraná=" + tabSelected
                 + (bar == null ? " lišta=nie" : " lišta=" + bar.rect.toShortString()
-                + " ikon=" + bar.targets.size()));
+                + " ikon=" + bar.targets.size() + " inaVybraná=" + bar.anySelected));
 
-        if (bar != null && barBitmap != null && bar.key.equals(barBitmapKey)) {
+        if (checkInsideBlockedTab(pkg, root, bar, tabSelected)) return;
+
+        boolean night = isNight();
+        Integer barColor = barColors.get(pkg + (night ? ":n" : ":d"));
+        if (bar != null && barBitmap != null && bar.key.equals(barBitmapKey) && barColor != null) {
             barTargets = bar.targets;
             placeOverlay(bar.rect);
-            overlay.showBar(barBitmap, bar.icons, Math.min(2, bar.rect.width() - 1));
+            overlay.showBar(barBitmap, bar.icons, barColor);
         } else {
             placeOverlay(tabRect);
-            overlay.showSolid(colorFor(pkg, tabRect));
+            overlay.showSolid(barColor != null ? barColor : colorFor(pkg, tabRect));
         }
 
-        if (bar != null) {
+        if (bar != null && Build.VERSION.SDK_INT >= 34) {
             if (!bar.key.equals(lastBarKey)) {
                 lastBarKey = bar.key;
                 forceCapture = true;
             }
             Rect winBounds = new Rect();
             win.getBoundsInScreen(winBounds);
-            requestCapture(win.getId(), winBounds, bar);
+            requestCapture(win.getId(), winBounds, bar, pkg + (night ? ":n" : ":d"));
         }
         startPeriodic();
+    }
+
+    /**
+     * Si práve na karte Reels/Shorts (napr. po swipnutí)? Potom ťa vráti na Domov.
+     * Karta je otvorená, keď je označená ako vybraná, alebo keď appka inak vyberanie
+     * kariet hlási, ale teraz nie je vybraná žiadna z ostatných.
+     */
+    private boolean checkInsideBlockedTab(String pkg, AccessibilityNodeInfo root, Bar bar, boolean tabSelected) {
+        if (bar != null && bar.anySelected) sawSelection.add(pkg);
+        boolean inside = tabSelected
+                || (bar != null && !bar.anySelected && sawSelection.contains(pkg));
+        long now = SystemClock.uptimeMillis();
+        if (!inside) {
+            reelsSince = 0;
+            return false;
+        }
+        // pri nepriamom znaku počkáme chvíľu, či to nie je len prechodný stav
+        if (!tabSelected) {
+            if (reelsSince == 0) {
+                reelsSince = now;
+                handler.postDelayed(this::scheduleOverlayUpdate, 300);
+                return false;
+            }
+            if (now - reelsSince < 250) return false;
+        }
+        if (now - lastLeave < 800) return false;
+        lastLeave = now;
+        reelsSince = 0;
+        leaveToHome(pkg, root, bar);
+        return true;
+    }
+
+    private void leaveToHome(String pkg, AccessibilityNodeInfo root, Bar bar) {
+        AccessibilityNodeInfo home = null;
+        if (IG.equals(pkg) && root != null) {
+            List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByViewId(IG + ":id/feed_tab");
+            if (!l.isEmpty()) home = l.get(0);
+        }
+        if (home == null && bar != null && !bar.targets.isEmpty()) home = bar.targets.get(0); // úplne vľavo = Domov
+        boolean ok = home != null && home.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        if (!ok) performGlobalAction(GLOBAL_ACTION_BACK);
+        forceCapture = true;
+        scheduleOverlayUpdate();
+        DiagLog.add("BLOK: karta " + (IG.equals(pkg) ? "Reels" : "Shorts") + " otvorená -> Domov"
+                + (ok ? "" : " (späť)"));
     }
 
     // ---------------------------------------------------------------------
@@ -294,79 +346,93 @@ public class BlockerService extends AccessibilityService {
                 || (t != null && t.toString().trim().equalsIgnoreCase(label));
     }
 
+    private static boolean selectedIn(AccessibilityNodeInfo n, int depth) {
+        if (n.isSelected() || n.isChecked()) return true;
+        if (depth == 0) return false;
+        for (int i = 0; i < n.getChildCount(); i++) {
+            AccessibilityNodeInfo c = n.getChild(i);
+            if (c != null && selectedIn(c, depth - 1)) return true;
+        }
+        return false;
+    }
+
     // ---------------------------------------------------------------------
-    //  Lišta: kontajner a ostatné tlačidlá
+    //  Lišta: ostatné tlačidlá v tom istom riadku ako skrytá karta
     // ---------------------------------------------------------------------
 
     private static final class Bar {
-        final Rect rect = new Rect();                          // celá lišta na obrazovke
+        final Rect rect = new Rect();                                  // pás lišty na obrazovke
         final List<AccessibilityNodeInfo> targets = new ArrayList<>(); // kam posielať ťuknutia
-        Rect[] icons;                                          // ponechané tlačidlá v rámci lišty
-        String key;                                            // geometria (na zistenie zmeny)
+        Rect[] icons;                                                  // ponechané tlačidlá v rámci pásu
+        boolean anySelected;                                           // je vybraná iná karta?
+        String key;                                                    // geometria (na zistenie zmeny)
     }
 
-    private Bar findBar(AccessibilityNodeInfo tab) {
+    private Bar findBar(AccessibilityNodeInfo tab, Rect tabRect) {
         int screenW = screenWidth();
-        Rect r = new Rect();
-        AccessibilityNodeInfo slot = tab;
-        AccessibilityNodeInfo container = tab.getParent();
-        for (int i = 0; i < 5 && container != null; i++) {
-            container.getBoundsInScreen(r);
-            if (r.width() >= screenW * 0.9f) break;
-            slot = container;
-            container = container.getParent();
+        AccessibilityNodeInfo anc = tab;
+        for (int level = 0; level < 6; level++) {
+            anc = anc.getParent();
+            if (anc == null) return null;
+            List<Rect> rects = new ArrayList<>();
+            List<AccessibilityNodeInfo> nodes = new ArrayList<>();
+            collectRow(anc, tabRect, screenW, rects, nodes, 0);
+            if (rects.size() >= 2) return buildBar(tabRect, screenW, rects, nodes);
         }
-        if (container == null) return null;
-        container.getBoundsInScreen(r);
-        if (r.width() < screenW * 0.9f || r.height() > screenHeight() * 0.15f) return null;
+        return null;
+    }
 
-        Rect slotRect = new Rect();
-        slot.getBoundsInScreen(slotRect);
-
-        List<Rect> rects = new ArrayList<>();
-        List<AccessibilityNodeInfo> targets = new ArrayList<>();
-        for (int i = 0; i < container.getChildCount(); i++) {
-            AccessibilityNodeInfo c = container.getChild(i);
+    /** Zbiera klikateľné tlačidlá, ktoré sú v rovnakom riadku a podobne veľké ako karta. */
+    private static void collectRow(AccessibilityNodeInfo n, Rect tabRect, int screenW,
+                                   List<Rect> rects, List<AccessibilityNodeInfo> nodes, int depth) {
+        if (depth > 8) return;
+        int tabH = tabRect.height();
+        for (int i = 0; i < n.getChildCount(); i++) {
+            AccessibilityNodeInfo c = n.getChild(i);
             if (c == null || !c.isVisibleToUser()) continue;
-            Rect cr = new Rect();
-            c.getBoundsInScreen(cr);
-            if (cr.isEmpty() || cr.equals(slotRect) || cr.height() < r.height() * 0.4f) continue;
-            if (!cr.intersect(r)) continue;
-            AccessibilityNodeInfo t = clickableIn(c, 3);
-            if (t == null) continue;
-            // zoradiť zľava doprava
-            int at = 0;
-            while (at < rects.size() && rects.get(at).left < cr.left) at++;
-            rects.add(at, cr);
-            targets.add(at, t);
+            Rect r = new Rect();
+            c.getBoundsInScreen(r);
+            if (r.isEmpty() || r.bottom <= tabRect.top || r.top >= tabRect.bottom) continue;
+            boolean inRow = c.isClickable()
+                    && Math.abs(r.centerY() - tabRect.centerY()) <= tabH / 2
+                    && r.height() >= tabH * 0.5f && r.height() <= tabH * 1.6f
+                    && r.width() <= screenW / 2
+                    && !r.contains(tabRect) && !Rect.intersects(r, tabRect);
+            if (inRow) {
+                boolean dup = false;
+                for (Rect o : rects) if (Rect.intersects(o, r)) { dup = true; break; }
+                if (!dup) {
+                    int at = 0;
+                    while (at < rects.size() && rects.get(at).left < r.left) at++;
+                    rects.add(at, r);
+                    nodes.add(at, c);
+                }
+                continue;
+            }
+            collectRow(c, tabRect, screenW, rects, nodes, depth + 1);
         }
-        if (rects.size() < 2) return null;
+    }
 
+    private static Bar buildBar(Rect tabRect, int screenW, List<Rect> rects, List<AccessibilityNodeInfo> nodes) {
+        int top = tabRect.top, bottom = tabRect.bottom;
+        for (Rect r : rects) {
+            top = Math.min(top, r.top);
+            bottom = Math.max(bottom, r.bottom);
+        }
         Bar bar = new Bar();
-        bar.rect.set(r);
-        bar.targets.addAll(targets);
+        bar.rect.set(0, top, screenW, bottom);
+        bar.targets.addAll(nodes);
         bar.icons = new Rect[rects.size()];
-        StringBuilder key = new StringBuilder(r.toShortString());
+        StringBuilder key = new StringBuilder(bar.rect.toShortString());
         for (int i = 0; i < rects.size(); i++) {
             Rect rel = new Rect(rects.get(i));
-            rel.offset(-r.left, -r.top);
+            rel.offset(0, -top);
             bar.icons[i] = rel;
             key.append('|').append(rel.toShortString());
+            if (selectedIn(nodes.get(i), 2)) bar.anySelected = true;
         }
         bar.key = key.toString();
         return bar;
-    }
-
-    private static AccessibilityNodeInfo clickableIn(AccessibilityNodeInfo n, int depth) {
-        if (n.isClickable()) return n;
-        if (depth == 0) return null;
-        for (int i = 0; i < n.getChildCount(); i++) {
-            AccessibilityNodeInfo c = n.getChild(i);
-            if (c == null) continue;
-            AccessibilityNodeInfo hit = clickableIn(c, depth - 1);
-            if (hit != null) return hit;
-        }
-        return null;
     }
 
     private void clickTarget(int index, int action) {
@@ -379,8 +445,8 @@ public class BlockerService extends AccessibilityService {
         handler.postDelayed(() -> { forceCapture = true; scheduleOverlayUpdate(); }, 800);
     }
 
-    /** Snímka len okna appky (bez nášho prekrytia), z nej sa vystrihne lišta. */
-    private void requestCapture(int windowId, Rect winBounds, Bar bar) {
+    /** Snímka len okna appky (bez nášho prekrytia), z nej sa vystrihne lišta a jej farba. */
+    private void requestCapture(int windowId, Rect winBounds, Bar bar, String colorKey) {
         if (Build.VERSION.SDK_INT < 34 || captureInFlight) return;
         long now = SystemClock.uptimeMillis();
         long since = now - lastCapture;
@@ -414,9 +480,12 @@ public class BlockerService extends AccessibilityService {
                             Bitmap sw = hw.copy(Bitmap.Config.ARGB_8888, false);
                             hw.recycle();
                             if (sw != null) {
-                                if (crop.left >= 0 && crop.top >= 0
-                                        && crop.right <= sw.getWidth() && crop.bottom <= sw.getHeight()) {
-                                    cut = Bitmap.createBitmap(sw, crop.left, crop.top, crop.width(), crop.height());
+                                Rect c = new Rect(crop);
+                                if (c.intersect(0, 0, sw.getWidth(), sw.getHeight()) && c.height() > 4) {
+                                    cut = Bitmap.createBitmap(sw, c.left, c.top, c.width(), c.height());
+                                } else {
+                                    DiagLog.add("Lišta mimo snímky: " + crop.toShortString()
+                                            + " snímka " + sw.getWidth() + "x" + sw.getHeight());
                                 }
                                 sw.recycle();
                             }
@@ -431,6 +500,7 @@ public class BlockerService extends AccessibilityService {
                         cut.recycle();
                         return;
                     }
+                    barColors.put(colorKey, backgroundOf(cut));
                     Bitmap old = barBitmap;
                     barBitmap = cut;
                     barBitmapKey = key;
@@ -441,13 +511,38 @@ public class BlockerService extends AccessibilityService {
                 @Override
                 public void onFailure(int errorCode) {
                     captureInFlight = false;
-                    if (Prefs.on(prefs, Prefs.DIAG)) DiagLog.add("Snímka lišty zlyhala: " + errorCode);
+                    DiagLog.add("Snímka lišty zlyhala, kód " + errorCode);
                 }
             });
         } catch (RuntimeException ex) {
             captureInFlight = false;
             DiagLog.add("Snímka lišty nedostupná: " + ex);
         }
+    }
+
+    /** Farba pozadia lišty = najčastejšia farba v jej štyroch rohoch. */
+    private static int backgroundOf(Bitmap b) {
+        int w = b.getWidth(), h = b.getHeight();
+        int[] px = {
+                b.getPixel(2, 2), b.getPixel(2, h - 3),
+                b.getPixel(w - 3, 2), b.getPixel(w - 3, h - 3)
+        };
+        int best = px[2], bestCount = 0;
+        for (int a : px) {
+            int count = 0;
+            for (int o : px) if (close(a, o)) count++;
+            if (count > bestCount) {
+                bestCount = count;
+                best = a;
+            }
+        }
+        return best | 0xFF000000;
+    }
+
+    private static boolean close(int a, int b) {
+        return Math.abs(((a >> 16) & 0xFF) - ((b >> 16) & 0xFF)) < 6
+                && Math.abs(((a >> 8) & 0xFF) - ((b >> 8) & 0xFF)) < 6
+                && Math.abs((a & 0xFF) - (b & 0xFF)) < 6;
     }
 
     /** Kým je prekrytie zobrazené, občas obnoví obraz lišty (odznaky správ a pod.). */
@@ -524,22 +619,27 @@ public class BlockerService extends AccessibilityService {
     }
 
     // =====================================================================
-    //  Farba lišty pre jednoduchý režim — zo snímky obrazovky vedľa ikony
+    //  Farba pre jednoduchý režim (Android 11–13) — zo snímky obrazovky
     // =====================================================================
 
-    private int colorFor(String pkg, Rect r) {
-        boolean night = (getResources().getConfiguration().uiMode
+    private boolean isNight() {
+        return (getResources().getConfiguration().uiMode
                 & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+    }
+
+    private int colorFor(String pkg, Rect r) {
+        boolean night = isNight();
         String key = pkg + (night ? ":n" : ":d");
         Integer c = sampledColors.get(key);
         Long at = sampledAt.get(key);
         long now = SystemClock.uptimeMillis();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+        // na Androide 14+ farbu zistí snímka okna appky, tu netreba
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Build.VERSION.SDK_INT < 34
                 && (at == null || now - at > 5000) && now - lastScreenshot > 2000) {
             sampleColor(key, new Rect(r));
         }
         if (c != null) return c;
-        if (night) return YT.equals(pkg) ? 0xFF0F0F0F : 0xFF000000;
+        if (night) return YT.equals(pkg) ? 0xFF0F0F0F : 0xFF0C0C0C;
         return 0xFFFFFFFF;
     }
 
@@ -547,9 +647,9 @@ public class BlockerService extends AccessibilityService {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return;
         lastScreenshot = SystemClock.uptimeMillis();
         int screenW = screenWidth();
-        // bod tesne vedľa ikony (mimo nášho obdĺžnika), v strede výšky lišty
-        final int x = r.left > 6 ? r.left - 4 : Math.min(r.right + 4, screenW - 1);
-        final int y = r.centerY();
+        // bod vedľa ikony (mimo nášho obdĺžnika), pri hornom okraji lišty — mimo zvýraznenia susednej karty
+        final int x = r.right + 4 < screenW ? r.right + 4 : r.left - 4;
+        final int y = r.top + 2;
         try {
             takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(), new TakeScreenshotCallback() {
                 @Override

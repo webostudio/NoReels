@@ -24,13 +24,11 @@ final class BarView extends View {
 
     private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
     private final GestureDetector gestures;
-    private final Rect tmpSrc = new Rect();
     private final Rect tmpDst = new Rect();
 
     private Bitmap bar;      // výrez celej lišty
     private Rect[] icons;    // ponechané tlačidlá (súradnice v rámci lišty)
-    private int bgX;         // stĺpec pozadia lišty (bez ikon)
-    private int solid = 0xFF000000;
+    private int solid = 0xFF000000; // farba pozadia lišty
 
     BarView(Context c, Listener listener) {
         super(c);
@@ -62,10 +60,10 @@ final class BarView extends View {
         invalidate();
     }
 
-    void showBar(Bitmap bar, Rect[] icons, int bgX) {
+    void showBar(Bitmap bar, Rect[] icons, int bgColor) {
         this.bar = bar;
         this.icons = icons;
-        this.bgX = bgX;
+        this.solid = bgColor;
         invalidate();
     }
 
@@ -86,13 +84,7 @@ final class BarView extends View {
             return;
         }
         int w = getWidth();
-        int h = getHeight();
-
-        // pozadie: 1 px stĺpec z prázdneho miesta lišty roztiahnutý na celú šírku
-        // (zachová aj prípadnú deliacu čiaru hore)
-        tmpSrc.set(bgX, 0, bgX + 1, bar.getHeight());
-        tmpDst.set(0, 0, w, h);
-        canvas.drawBitmap(bar, tmpSrc, tmpDst, paint);
+        canvas.drawColor(solid); // pozadie lišty
 
         float slot = w / (float) icons.length;
         for (int i = 0; i < icons.length; i++) {
