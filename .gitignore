@@ -1,0 +1,9 @@
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+
+# zostavené APK ide do GitHub Release, nie do repa
+*.apk
