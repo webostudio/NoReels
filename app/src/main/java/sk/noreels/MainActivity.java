@@ -63,6 +63,7 @@ public class MainActivity extends Activity {
         col.addView(toggle("Skryť kartu Reels v Instagrame", Prefs.IG_TAB));
         col.addView(toggle("Skryť kartu Shorts v YouTube", Prefs.YT_TAB));
         col.addView(toggle("Pri poslanom reeli/shorte zakázať posun na ďalší", Prefs.BLOCK_SCROLL));
+        col.addView(toggle("Pri swipe medzi Domovom a správami zakryť Reels (krátke stmavenie)", Prefs.CURTAIN));
 
         col.addView(text("\nAk lišta vyzerá zle (staré ikony, zlá farba), nechaj ju načítať nanovo:"));
         col.addView(button("Načítať vzhľad lišty nanovo", v -> {

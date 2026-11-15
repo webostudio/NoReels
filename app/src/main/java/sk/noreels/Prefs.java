@@ -9,6 +9,7 @@ final class Prefs {
     static final String YT_TAB = "yt_tab";
     static final String BLOCK_SCROLL = "block_scroll";
     static final String DIAG = "diag";
+    static final String CURTAIN = "curtain";
 
     private Prefs() {}
 

@@ -51,6 +51,7 @@ public class BlockerService extends AccessibilityService {
     static final String YT = "com.google.android.youtube";
     private static final String IG_PAGER = IG + ":id/swipeable_tab_view_pager";
     private static final boolean DEBUG = false;
+    private static final boolean JUMP = false;
     private static final String TAG = "NoReelsDbg";
 
     static volatile boolean running;
@@ -61,10 +62,15 @@ public class BlockerService extends AccessibilityService {
     // aby prekrytie stále reagovalo a kreslilo plynulo
     private android.os.HandlerThread worker;
     private Handler bg;
+    // vlastné vlákno na preskočenie Reels — nesmie čakať v rade za pomalým zisťovaním stavu
+    private android.os.HandlerThread fastWorker;
+    private Handler fast;
+    private volatile String reelsDesc = "Reels"; // popis karty Reels (podľa jazyka appky)
     private boolean queryRunning;
     private boolean queryAgain;
     private final Map<String, String> titles = new HashMap<>(); // názov okna appky (na rýchle spoznanie)
     private long preShownAt;
+    private long lastHideAt;
     private final Runnable updateRunnable = () -> {
         updateScheduled = false;
         updateOverlay();
@@ -116,12 +122,44 @@ public class BlockerService extends AccessibilityService {
     // --- swipe medzi kartami (Instagram) ---
     private volatile int blockedPagerIndex = 1;
     private volatile int lastPagerIdx = -1;
+    private volatile AccessibilityNodeInfo igPager; // stránkovač kariet (zapamätaný, aby sa nemusel hľadať)
+    private volatile int lastPagerDx;               // smer posledného posunu stránok
+    private volatile long lastPagerDxAt;
+    private volatile AccessibilityNodeInfo tabAfter, tabBefore; // susedné karty skrytej karty
+
+    // --- záves: kým swipe prechádza cez Reels, obsah sa na chvíľu zakryje farbou pozadia ---
+    private android.view.View curtain;
+    private boolean curtainHiding;
+    private long curtainKeepUntil;
+    private boolean transit;      // Reels sú práve "vybrané" a preskakujú sa
+    private long transitSince;
+    private int barTop;           // horný okraj lišty na obrazovke
+    private final Runnable curtainWatch = new Runnable() {
+        @Override
+        public void run() {
+            if (curtain == null || curtainHiding) return;
+            long now = SystemClock.uptimeMillis();
+            boolean keep = (transit && now - transitSince < 1500) || now < curtainKeepUntil;
+            if (keep) {
+                handler.postDelayed(this, 60);
+            } else {
+                hideCurtain();
+            }
+        }
+    };
     private long lastSkip;
 
     // --- blokovanie posúvania v prehrávači ---
     private int pagerKey;
     private int baseIndex = -1;
     private long lastKick;
+
+    // --- YouTube: prehrávač Shorts ---
+    private boolean ytPlayerOpen;
+    private int ytBaseItem;        // stránka prehrávača s poslaným shortom
+    private long ytPlayerSince;
+    private long ytFrontAt;        // kedy YouTube prišiel do popredia z inej appky (napr. z odkazu)
+    private int ytMisses = 100;    // koľko zistení po sebe YouTube nebol na obrazovke
 
     // --- diagnostika ---
     private String lastDiagTab = "";
@@ -145,6 +183,9 @@ public class BlockerService extends AccessibilityService {
         worker = new android.os.HandlerThread("noreels-query");
         worker.start();
         bg = new Handler(worker.getLooper());
+        fastWorker = new android.os.HandlerThread("noreels-skip");
+        fastWorker.start();
+        fast = new Handler(fastWorker.getLooper());
         if (DEBUG) registerReceiver(debugReceiver, new IntentFilter("sk.noreels.DBG_SWIPE"));
         DiagLog.add("Služba spustená (Android API " + Build.VERSION.SDK_INT + ")");
     }
@@ -159,6 +200,7 @@ public class BlockerService extends AccessibilityService {
         }
         hideOverlay();
         if (worker != null) worker.quitSafely();
+        if (fastWorker != null) fastWorker.quitSafely();
         super.onDestroy();
     }
 
@@ -172,6 +214,77 @@ public class BlockerService extends AccessibilityService {
         boolean target = IG.equals(pkg) || YT.equals(pkg);
         int type = e.getEventType();
 
+        if (DEBUG && target && (type == AccessibilityEvent.TYPE_VIEW_SELECTED || type == AccessibilityEvent.TYPE_VIEW_SCROLLED)) {
+            Log.d(TAG, "EV " + AccessibilityEvent.eventTypeToString(type) + " cls=" + e.getClassName()
+                    + " desc=" + e.getContentDescription() + " txt=" + e.getText()
+                    + " from=" + e.getFromIndex() + " dx=" + e.getScrollDeltaX() + " sx=" + e.getScrollX());
+        }
+        if (type == AccessibilityEvent.TYPE_VIEW_CLICKED) {
+            if (YT.equals(pkg)) {
+
+            }
+            return;
+        }
+        if (type == AccessibilityEvent.TYPE_VIEW_SELECTED) {
+            // Instagram práve označil kartu Reels ako vybranú (swipe na ňu dorazil) => hneď preskočiť
+            if (IG.equals(pkg) && Prefs.on(prefs, Prefs.IG_TAB)) {
+                CharSequence desc = e.getContentDescription();
+                if (desc != null && reelsDesc.contentEquals(desc)) {
+                    transit = true;
+                    transitSince = SystemClock.uptimeMillis();
+                } else if (transit) {
+                    transit = false; // vybraná je už cieľová karta — nechať ju dobehnúť a odkryť
+                    curtainKeepUntil = SystemClock.uptimeMillis() + 220;
+                }
+                final AccessibilityNodeInfo pager = igPager;
+                boolean swiping = SystemClock.uptimeMillis() - lastPagerDxAt < 800;
+                if (pager != null && swiping && desc != null && reelsDesc.contentEquals(desc)) {
+                    // rýchla cesta: bez akýchkoľvek dopytov na appku
+                    fast.post(() -> {
+                        try {
+                            skipReels(pager);
+                        } catch (RuntimeException ignored) {}
+                    });
+                } else {
+                    final AccessibilityEvent copy = AccessibilityEvent.obtain(e);
+                    fast.post(() -> {
+                        try {
+                            AccessibilityNodeInfo src = copy.getSource();
+                            String id = src == null ? null : src.getViewIdResourceName();
+                            if (id != null && id.endsWith(":id/clips_tab")) {
+                                AccessibilityNodeInfo pg = igPager;
+                                if (pg == null) {
+                                    AccessibilityNodeInfo root = getRootInActiveWindow();
+                                    List<AccessibilityNodeInfo> l = root == null ? null
+                                            : root.findAccessibilityNodeInfosByViewId(IG_PAGER);
+                                    if (l != null && !l.isEmpty()) pg = l.get(0);
+                                }
+                                if (pg != null) skipReels(pg);
+                            }
+                        } catch (RuntimeException ignored) {
+                        } finally {
+                            copy.recycle();
+                        }
+                    });
+                }
+            }
+            return;
+        }
+        if (IG.equals(pkg) && type == AccessibilityEvent.TYPE_VIEW_SCROLLED
+                && e.getClassName() != null && e.getClassName().toString().endsWith(".ViewPager")
+                && e.getItemCount() >= 4 && e.getItemCount() <= 6) {
+            int dx = e.getScrollDeltaX(); // posun kariet práve prebieha: zapamätať smer
+            if (dx != 0 && dx != -1) {
+                lastPagerDx = dx;
+                lastPagerDxAt = SystemClock.uptimeMillis();
+                int fromIdx = e.getFromIndex();
+                int dir = dx > 0 ? 1 : -1;
+                if (fromIdx + dir == blockedPagerIndex || fromIdx == blockedPagerIndex) {
+                    curtainKeepUntil = lastPagerDxAt + 350; // ťahá sa smerom na Reels
+                    showCurtain();
+                }
+            }
+        }
         if (target && type == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             final AccessibilityEvent copy = AccessibilityEvent.obtain(e);
             bg.post(() -> {
@@ -192,6 +305,7 @@ public class BlockerService extends AccessibilityService {
             if (target) {
                 resetPager(); // nová obrazovka => nový prehrávač začína odznova
                 onTargetWindow(pkg, cls);
+                if (YT.equals(pkg) && !YT.equals(lastStatePkg) && !ytPlayerOpen) ytFrontAt = SystemClock.uptimeMillis();
                 lastStatePkg = pkg;
             } else if (!pkg.isEmpty() && !pkg.equals(getPackageName())
                     && !pkg.equals("com.android.systemui") && !cls.contains("InputMethod")) {
@@ -210,10 +324,11 @@ public class BlockerService extends AccessibilityService {
     private void quickAppear() {
         if (lastShown.isEmpty() || titles.isEmpty()) return;
         long now = SystemClock.uptimeMillis();
+        if (now - lastHideAt < 1500) return; // appka sa práve zatvára — jej okno ešte chvíľu existuje
         try {
             for (AccessibilityWindowInfo w : getWindows()) {
                 if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
-                if (!w.isFocused() && !w.isActive()) continue;
+                if (!w.isFocused()) continue;
                 CharSequence title = w.getTitle();
                 if (title == null) continue;
                 for (Map.Entry<String, String> en : titles.entrySet()) {
@@ -229,6 +344,7 @@ public class BlockerService extends AccessibilityService {
                         barTargets = Collections.emptyList();
                         graceUntil = now + 4500;
                         preShownAt = now;
+                        updateLater(150); // overiť, že appka naozaj prišla
                     }
                     return;
                 }
@@ -284,21 +400,29 @@ public class BlockerService extends AccessibilityService {
                     + " from=" + from + " to=" + to);
         }
         if (IG_PAGER.equals(id)) {
+            igPager = src;
             handleTabSwipe(src, from);
             return;
         }
         final boolean viewer = isViewerPager(pkg, id);
         final int key = src.hashCode(); // rovnaký objekt prehrávača = rovnaký kľúč
-        handler.post(() -> onViewerScroll(pkg, viewer, key, from, to));
+        final int dy = e.getScrollDeltaY();
+        handler.post(() -> onViewerScroll(pkg, viewer, key, from, to, dy));
     }
 
-    private void onViewerScroll(String pkg, boolean viewer, int key, int from, int to) {
+    private void onViewerScroll(String pkg, boolean viewer, int key, int from, int to, int dy) {
         if (!viewer) {
             // posúvanie niečoho iného (chat, feed, komentáre) => mimo prehrávača
             resetPager();
             return;
         }
-        if (!Prefs.on(prefs, Prefs.BLOCK_SCROLL) || from < 0) return;
+        if (!Prefs.on(prefs, Prefs.BLOCK_SCROLL)) return;
+        if (from < 0) {
+            // YouTube neposiela poradie videa — stačí, že sa prehrávač naozaj posunul
+            if (YT.equals(pkg) && Math.abs(dy) > 40
+                    && SystemClock.uptimeMillis() - ytPlayerSince > 700) kick(pkg);
+            return;
+        }
         if (key != pagerKey || baseIndex < 0) {
             pagerKey = key;
             baseIndex = from;    // toto je reel/short, ktorý ti poslali
@@ -317,20 +441,67 @@ public class BlockerService extends AccessibilityService {
     }
 
     /** Plynulo pokračuje v smere swipu na ďalšiu kartu (Domov -> chaty, chaty -> Domov). */
-    private void skipReels(AccessibilityNodeInfo pager) {
+    private synchronized void skipReels(AccessibilityNodeInfo pager) {
         long now = SystemClock.uptimeMillis();
-        if (now - lastSkip < 600) return;
+        if (now - lastSkip < 450) return;
         lastSkip = now;
-        boolean forward = lastPagerIdx >= 0 && lastPagerIdx < blockedPagerIndex;
-        boolean ok = pager.performAction(forward
+        // smer: podľa práve prebiehajúceho posunu, inak podľa naposledy otvorenej karty
+        boolean forward = now - lastPagerDxAt < 700
+                ? lastPagerDx > 0
+                : lastPagerIdx >= 0 && lastPagerIdx < blockedPagerIndex;
+        AccessibilityNodeInfo direct = forward ? tabAfter : tabBefore;
+        boolean ok = JUMP && direct != null && direct.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        if (!ok) ok = pager.performAction(forward
                 ? AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
                 : AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD);
+        if (DEBUG) Log.d(TAG, "SKIP forward=" + forward + " ok=" + ok + " last=" + lastPagerIdx);
         DiagLog.add("SWIPE cez Reels -> " + (forward ? "ďalej" : "späť") + (ok ? "" : " (zlyhalo)"));
+    }
+
+    /**
+     * YouTube: otvoril sa prehrávač Shorts. Short z odkazu (YouTube práve prišiel do popredia z inej
+     * appky) sa nechá pozrieť; short otvorený vnútri YouTube (feed, hľadanie, kanál) sa hneď zavrie.
+     */
+    private void checkYtPlayer(boolean open, List<Integer> items, long now) {
+        if (!open) {
+            ytPlayerOpen = false;
+            ytBaseItem = 0;
+            return;
+        }
+        if (!ytPlayerOpen) {
+            ytPlayerOpen = true;
+            ytPlayerSince = now;
+            ytBaseItem = 0;
+            // z odkazu = YouTube sa objavil len pred chvíľou; inak sa short otvoril vnútri YouTube
+            boolean fromLink = now - ytFrontAt < 6000;
+            if (DEBUG) Log.d(TAG, "YT player open fromLink=" + fromLink + " front=" + (now - ytFrontAt));
+            if (!fromLink) {
+                performGlobalAction(GLOBAL_ACTION_BACK);
+                DiagLog.add("BLOK: short otvorený vnútri YouTube -> späť");
+                Toast.makeText(this, "Shorts z YouTube sú zablokované", Toast.LENGTH_SHORT).show();
+                return;
+            }
+        }
+        // poslaný short: zapamätať si jeho stránku; keď sa objaví iná (posun na ďalší) => zavrieť
+        if (!Prefs.on(prefs, Prefs.BLOCK_SCROLL)) return;
+        if (ytBaseItem == 0) {
+            if (items.size() == 1 && now - ytPlayerSince > 600) ytBaseItem = items.get(0);
+            else updateLater(300);
+            return;
+        }
+        for (int item : items) {
+            if (item != ytBaseItem) {
+                if (DEBUG) Log.d(TAG, "YT next short visible -> kick");
+                kick(YT);
+                updateLater(400);
+                return;
+            }
+        }
     }
 
     private void kick(String pkg) {
         long now = SystemClock.uptimeMillis();
-        if (now - lastKick < 1500) return;
+        if (now - lastKick < (YT.equals(pkg) ? 700 : 1500)) return;
         lastKick = now;
         resetPager();
         performGlobalAction(GLOBAL_ACTION_BACK);
@@ -390,7 +561,8 @@ public class BlockerService extends AccessibilityService {
         AccessibilityWindowInfo win;
         String pkg, seenPkg;
         final Rect tabRect = new Rect();
-        boolean misplaced, usable, tabSelected;
+        boolean misplaced, usable, tabSelected, ytPlayer;
+        final List<Integer> ytItems = new ArrayList<>();
         Bar bar;
     }
 
@@ -408,6 +580,15 @@ public class BlockerService extends AccessibilityService {
                 } else if (YT.equals(p) && Prefs.on(prefs, Prefs.YT_TAB)) {
                     q.seenPkg = p;
                     q.tab = findYtTab(r);
+                    for (AccessibilityNodeInfo n : r.findAccessibilityNodeInfosByViewId(YT + ":id/reel_recycler")) {
+                        if (!n.isVisibleToUser()) continue;
+                        q.ytPlayer = true;
+                        // ktoré videá (stránky prehrávača) sú práve vidieť
+                        for (int i = 0; i < n.getChildCount(); i++) {
+                            AccessibilityNodeInfo c = n.getChild(i);
+                            if (c != null && c.isVisibleToUser()) q.ytItems.add(c.hashCode());
+                        }
+                    }
                 }
                 if (q.tab != null) {
                     q.pkg = p;
@@ -447,7 +628,15 @@ public class BlockerService extends AccessibilityService {
 
         // appka sa práve objavila na obrazovke?
         if (seenPkg != null && !targetVisible && overlay == null) appearedAt = now;
+        // YouTube sa práve objavil na obrazovke (aj keď udalosť o okne ešte neprišla)
+        if (YT.equals(seenPkg)) {
+            if (ytMisses >= 2 && !YT.equals(lastStatePkg)) ytFrontAt = now; // predtým bola vpredu iná appka
+            ytMisses = 0;
+        } else if (ytMisses < 100) {
+            ytMisses++;
+        }
         targetVisible = seenPkg != null;
+        checkYtPlayer(q.ytPlayer, q.ytItems, now);
 
         if (!q.usable) {
             boolean targetInFront = seenPkg != null || IG.equals(lastStatePkg) || YT.equals(lastStatePkg)
@@ -478,15 +667,25 @@ public class BlockerService extends AccessibilityService {
         }
         graceUntil = 0;
         hadBar.put(pkg, true);
+        if (IG.equals(pkg) && tab.getContentDescription() != null) {
+            reelsDesc = tab.getContentDescription().toString();
+        }
         if (win.getTitle() != null) titles.put(pkg, win.getTitle().toString());
 
         final Bar bar = q.bar;
         boolean tabSelected = q.tabSelected;
+        if (DEBUG && bar != null) {
+            StringBuilder sb = new StringBuilder("STATE reels=" + tabSelected + " sel=");
+            for (Tab t : bar.tabs) if (t.selected) sb.append(t.id).append(' ');
+            Log.d(TAG, sb.toString());
+        }
         diagTab("karta " + shortPkg(pkg) + " " + tabRect.toShortString() + " vybraná=" + tabSelected
                 + (bar == null ? " lišta=nie" : " lišta=" + bar.rect.toShortString()
                 + " ikon=" + bar.tabs.size() + " inaVybraná=" + bar.anySelected));
         if (bar != null && IG.equals(pkg)) {
             blockedPagerIndex = bar.blockedIndex;
+            tabAfter = bar.blockedIndex < bar.tabs.size() ? bar.tabs.get(bar.blockedIndex).node : null;
+            tabBefore = bar.blockedIndex > 0 ? bar.tabs.get(bar.blockedIndex - 1).node : null;
             for (int j = 0; j < bar.tabs.size(); j++) { // odkiaľ sa swipuje = naposledy vybraná karta
                 if (bar.tabs.get(j).selected) lastPagerIdx = j < bar.blockedIndex ? j : j + 1;
             }
@@ -557,6 +756,7 @@ public class BlockerService extends AccessibilityService {
         curTabs = bar.tabs;
         curIcons = icons;
         curBg = bg;
+        barTop = bar.rect.top;
         if (now < optimisticUntil && !selectedId.equals(optimisticId)
                 && overlay != null && overlay.isBarMode()) {
             updateLater(80); // appka ešte neprepla kartu — nechať okamžitú odozvu na ťuknutie
@@ -1162,7 +1362,69 @@ public class BlockerService extends AccessibilityService {
         }
     }
 
+    private void showCurtain() {
+        if (!Prefs.on(prefs, Prefs.CURTAIN) || overlay == null || !IG.equals(overlayPkg) || barTop <= 0) return;
+        if (curtain != null) {
+            if (curtainHiding) { // práve mizne — vrátiť späť
+                curtainHiding = false;
+                curtain.animate().cancel();
+                curtain.animate().alpha(1f).setDuration(80).withEndAction(null).start();
+                handler.removeCallbacks(curtainWatch);
+                handler.postDelayed(curtainWatch, 60);
+            }
+            return;
+        }
+        int statusId = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        int top = statusId > 0 ? getResources().getDimensionPixelSize(statusId) : 0;
+        android.view.View v = new android.view.View(this);
+        v.setBackgroundColor(curBg | 0xFF000000);
+        v.setAlpha(0f);
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                screenWidth(), barTop - top,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE // prst ďalej ovláda appku
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        lp.gravity = Gravity.TOP | Gravity.START;
+        lp.windowAnimations = 0;
+        lp.x = 0;
+        lp.y = top;
+        try {
+            wm.addView(v, lp);
+        } catch (RuntimeException ex) {
+            return;
+        }
+        curtain = v;
+        curtainHiding = false;
+        v.animate().alpha(1f).setDuration(80).start();
+        handler.removeCallbacks(curtainWatch);
+        handler.postDelayed(curtainWatch, 60);
+    }
+
+    private void hideCurtain() {
+        if (curtain == null || curtainHiding) return;
+        curtainHiding = true;
+        final android.view.View v = curtain;
+        v.animate().alpha(0f).setDuration(170).withEndAction(() -> {
+            if (curtain == v && curtainHiding) removeCurtain();
+        }).start();
+    }
+
+    private void removeCurtain() {
+        if (curtain == null) return;
+        try {
+            wm.removeViewImmediate(curtain);
+        } catch (RuntimeException ignored) {}
+        curtain = null;
+        curtainHiding = false;
+        transit = false;
+    }
+
     private void hideOverlay() {
+        removeCurtain();
+        if (overlay != null) lastHideAt = SystemClock.uptimeMillis();
         if (overlay != null) {
             try {
                 wm.removeViewImmediate(overlay);
