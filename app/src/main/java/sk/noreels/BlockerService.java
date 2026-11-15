@@ -13,20 +13,22 @@ import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.view.Display;
 import android.view.Gravity;
-import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 import android.widget.Toast;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 1) Nad kartu Reels (Instagram) / Shorts (YouTube) položí obdĺžnik vo farbe spodnej lišty,
- *    takže ikona nie je vidieť a ťuknutie na ňu nič neurobí.
+ * 1) Skryje kartu Reels (Instagram) / Shorts (YouTube).
+ *    Android 14+: spodnú lištu nakreslí nanovo bez tej karty, ostatné ikony rovnomerne rozložené.
+ *    Starší Android: kartu prekryje obdĺžnikom vo farbe lišty.
  * 2) Keď sa otvorí reel/short (napr. poslaný v správe) a skúsiš posunúť na ďalší,
  *    prehrávač sa zavrie (krok späť).
  */
@@ -41,15 +43,25 @@ public class BlockerService extends AccessibilityService {
     private SharedPreferences prefs;
     private WindowManager wm;
 
-    // --- prekrytie ikony ---
-    private View overlay;
+    // --- prekrytie ---
+    private BarView overlay;
     private WindowManager.LayoutParams overlayLp;
-    private String overlayPkg;
     private boolean updateScheduled;
+    private long lastTabBack;
     private final Map<String, Integer> sampledColors = new HashMap<>();
     private final Map<String, Long> sampledAt = new HashMap<>();
     private long lastScreenshot;
-    private long lastTabBack;
+
+    // --- prekreslená lišta (Android 14+) ---
+    private List<AccessibilityNodeInfo> barTargets = Collections.emptyList();
+    private Bitmap barBitmap;
+    private String barBitmapKey;
+    private String lastBarKey;
+    private long lastCapture;
+    private boolean captureInFlight;
+    private boolean capturePending;
+    private boolean forceCapture;
+    private boolean periodicRunning;
 
     // --- blokovanie posúvania ---
     private int pagerKey;
@@ -64,7 +76,7 @@ public class BlockerService extends AccessibilityService {
         running = true;
         prefs = Prefs.get(this);
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-        DiagLog.add("Služba spustená");
+        DiagLog.add("Služba spustená (Android " + Build.VERSION.SDK_INT + ")");
     }
 
     @Override
@@ -88,7 +100,8 @@ public class BlockerService extends AccessibilityService {
             handleScroll(e, pkg);
         }
         if (target && type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            resetPager(); // nová obrazovka => nový prehrávač začína odznova
+            resetPager();        // nová obrazovka => nový prehrávač začína odznova
+            forceCapture = true; // a lišta mohla zmeniť vybranú kartu
         }
         scheduleOverlayUpdate();
     }
@@ -113,8 +126,7 @@ public class BlockerService extends AccessibilityService {
         String id = src.getViewIdResourceName();
         int from = e.getFromIndex();
         int to = e.getToIndex();
-        boolean diag = Prefs.on(prefs, Prefs.DIAG);
-        if (diag) {
+        if (Prefs.on(prefs, Prefs.DIAG)) {
             DiagLog.add("SCROLL " + shortPkg(pkg) + " id=" + id + " cls=" + src.getClassName()
                     + " from=" + from + " to=" + to);
         }
@@ -153,7 +165,7 @@ public class BlockerService extends AccessibilityService {
     }
 
     // =====================================================================
-    //  Prekrytie karty Reels / Shorts
+    //  Prekrytie karty / lišty
     // =====================================================================
 
     private void scheduleOverlayUpdate() {
@@ -167,10 +179,10 @@ public class BlockerService extends AccessibilityService {
 
     private void updateOverlay() {
         AccessibilityNodeInfo tab = null;
+        AccessibilityWindowInfo win = null;
         String pkg = null;
         try {
-            List<AccessibilityWindowInfo> windows = getWindows();
-            for (AccessibilityWindowInfo w : windows) {
+            for (AccessibilityWindowInfo w : getWindows()) {
                 if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
                 AccessibilityNodeInfo root = w.getRoot();
                 if (root == null || root.getPackageName() == null) continue;
@@ -182,6 +194,7 @@ public class BlockerService extends AccessibilityService {
                 }
                 if (tab != null) {
                     pkg = p;
+                    win = w;
                     break;
                 }
             }
@@ -194,14 +207,12 @@ public class BlockerService extends AccessibilityService {
             hideOverlay();
             return;
         }
-        Rect r = new Rect();
-        tab.getBoundsInScreen(r);
-        if (r.isEmpty() || !tab.isVisibleToUser()) {
+        Rect tabRect = new Rect();
+        tab.getBoundsInScreen(tabRect);
+        if (tabRect.isEmpty() || !tab.isVisibleToUser()) {
             hideOverlay();
             return;
         }
-        diagTab("karta " + shortPkg(pkg) + " id=" + tab.getViewIdResourceName()
-                + " desc=" + tab.getContentDescription() + " " + r.toShortString());
 
         // Poistka: ak by sa karta predsa nejako otvorila, vrátime sa späť.
         if (tab.isSelected()) {
@@ -212,8 +223,37 @@ public class BlockerService extends AccessibilityService {
                 DiagLog.add("BLOK: karta bola otvorená -> späť");
             }
         }
-        showOverlay(pkg, r);
+
+        Bar bar = Build.VERSION.SDK_INT >= 34 ? findBar(tab) : null;
+        diagTab("karta " + shortPkg(pkg) + " id=" + tab.getViewIdResourceName()
+                + " desc=" + tab.getContentDescription() + " " + tabRect.toShortString()
+                + (bar == null ? " lišta=nie" : " lišta=" + bar.rect.toShortString()
+                + " ikon=" + bar.targets.size()));
+
+        if (bar != null && barBitmap != null && bar.key.equals(barBitmapKey)) {
+            barTargets = bar.targets;
+            placeOverlay(bar.rect);
+            overlay.showBar(barBitmap, bar.icons, Math.min(2, bar.rect.width() - 1));
+        } else {
+            placeOverlay(tabRect);
+            overlay.showSolid(colorFor(pkg, tabRect));
+        }
+
+        if (bar != null) {
+            if (!bar.key.equals(lastBarKey)) {
+                lastBarKey = bar.key;
+                forceCapture = true;
+            }
+            Rect winBounds = new Rect();
+            win.getBoundsInScreen(winBounds);
+            requestCapture(win.getId(), winBounds, bar);
+        }
+        startPeriodic();
     }
+
+    // ---------------------------------------------------------------------
+    //  Hľadanie karty
+    // ---------------------------------------------------------------------
 
     /** Instagram: tlačidlo karty Reels v spodnej lište. */
     private AccessibilityNodeInfo findIgTab(AccessibilityNodeInfo root) {
@@ -254,11 +294,196 @@ public class BlockerService extends AccessibilityService {
                 || (t != null && t.toString().trim().equalsIgnoreCase(label));
     }
 
-    private void showOverlay(String pkg, Rect r) {
-        int color = colorFor(pkg, r);
+    // ---------------------------------------------------------------------
+    //  Lišta: kontajner a ostatné tlačidlá
+    // ---------------------------------------------------------------------
+
+    private static final class Bar {
+        final Rect rect = new Rect();                          // celá lišta na obrazovke
+        final List<AccessibilityNodeInfo> targets = new ArrayList<>(); // kam posielať ťuknutia
+        Rect[] icons;                                          // ponechané tlačidlá v rámci lišty
+        String key;                                            // geometria (na zistenie zmeny)
+    }
+
+    private Bar findBar(AccessibilityNodeInfo tab) {
+        int screenW = screenWidth();
+        Rect r = new Rect();
+        AccessibilityNodeInfo slot = tab;
+        AccessibilityNodeInfo container = tab.getParent();
+        for (int i = 0; i < 5 && container != null; i++) {
+            container.getBoundsInScreen(r);
+            if (r.width() >= screenW * 0.9f) break;
+            slot = container;
+            container = container.getParent();
+        }
+        if (container == null) return null;
+        container.getBoundsInScreen(r);
+        if (r.width() < screenW * 0.9f || r.height() > screenHeight() * 0.15f) return null;
+
+        Rect slotRect = new Rect();
+        slot.getBoundsInScreen(slotRect);
+
+        List<Rect> rects = new ArrayList<>();
+        List<AccessibilityNodeInfo> targets = new ArrayList<>();
+        for (int i = 0; i < container.getChildCount(); i++) {
+            AccessibilityNodeInfo c = container.getChild(i);
+            if (c == null || !c.isVisibleToUser()) continue;
+            Rect cr = new Rect();
+            c.getBoundsInScreen(cr);
+            if (cr.isEmpty() || cr.equals(slotRect) || cr.height() < r.height() * 0.4f) continue;
+            if (!cr.intersect(r)) continue;
+            AccessibilityNodeInfo t = clickableIn(c, 3);
+            if (t == null) continue;
+            // zoradiť zľava doprava
+            int at = 0;
+            while (at < rects.size() && rects.get(at).left < cr.left) at++;
+            rects.add(at, cr);
+            targets.add(at, t);
+        }
+        if (rects.size() < 2) return null;
+
+        Bar bar = new Bar();
+        bar.rect.set(r);
+        bar.targets.addAll(targets);
+        bar.icons = new Rect[rects.size()];
+        StringBuilder key = new StringBuilder(r.toShortString());
+        for (int i = 0; i < rects.size(); i++) {
+            Rect rel = new Rect(rects.get(i));
+            rel.offset(-r.left, -r.top);
+            bar.icons[i] = rel;
+            key.append('|').append(rel.toShortString());
+        }
+        bar.key = key.toString();
+        return bar;
+    }
+
+    private static AccessibilityNodeInfo clickableIn(AccessibilityNodeInfo n, int depth) {
+        if (n.isClickable()) return n;
+        if (depth == 0) return null;
+        for (int i = 0; i < n.getChildCount(); i++) {
+            AccessibilityNodeInfo c = n.getChild(i);
+            if (c == null) continue;
+            AccessibilityNodeInfo hit = clickableIn(c, depth - 1);
+            if (hit != null) return hit;
+        }
+        return null;
+    }
+
+    private void clickTarget(int index, int action) {
+        if (index < 0 || index >= barTargets.size()) return;
+        AccessibilityNodeInfo n = barTargets.get(index);
+        n.refresh();
+        n.performAction(action);
+        // vybraná karta sa zmení — obnoviť obraz lišty
+        handler.postDelayed(() -> { forceCapture = true; scheduleOverlayUpdate(); }, 250);
+        handler.postDelayed(() -> { forceCapture = true; scheduleOverlayUpdate(); }, 800);
+    }
+
+    /** Snímka len okna appky (bez nášho prekrytia), z nej sa vystrihne lišta. */
+    private void requestCapture(int windowId, Rect winBounds, Bar bar) {
+        if (Build.VERSION.SDK_INT < 34 || captureInFlight) return;
+        long now = SystemClock.uptimeMillis();
+        long since = now - lastCapture;
+        if (!forceCapture && since < 2000) return;
+        if (since < 400) { // systém dovolí snímku len párkrát za sekundu
+            if (!capturePending) {
+                capturePending = true;
+                handler.postDelayed(() -> {
+                    capturePending = false;
+                    forceCapture = true;
+                    scheduleOverlayUpdate();
+                }, 400 - since);
+            }
+            return;
+        }
+        forceCapture = false;
+        captureInFlight = true;
+        lastCapture = now;
+        final String key = bar.key;
+        final Rect crop = new Rect(bar.rect);
+        crop.offset(-winBounds.left, -winBounds.top);
+        try {
+            takeScreenshotOfWindow(windowId, getMainExecutor(), new TakeScreenshotCallback() {
+                @Override
+                public void onSuccess(ScreenshotResult result) {
+                    captureInFlight = false;
+                    Bitmap cut = null;
+                    try {
+                        Bitmap hw = Bitmap.wrapHardwareBuffer(result.getHardwareBuffer(), result.getColorSpace());
+                        if (hw != null) {
+                            Bitmap sw = hw.copy(Bitmap.Config.ARGB_8888, false);
+                            hw.recycle();
+                            if (sw != null) {
+                                if (crop.left >= 0 && crop.top >= 0
+                                        && crop.right <= sw.getWidth() && crop.bottom <= sw.getHeight()) {
+                                    cut = Bitmap.createBitmap(sw, crop.left, crop.top, crop.width(), crop.height());
+                                }
+                                sw.recycle();
+                            }
+                        }
+                    } catch (RuntimeException ex) {
+                        DiagLog.add("Chyba snímky lišty: " + ex);
+                    } finally {
+                        result.getHardwareBuffer().close();
+                    }
+                    if (cut == null) return;
+                    if (!key.equals(lastBarKey)) { // lišta sa medzitým zmenila
+                        cut.recycle();
+                        return;
+                    }
+                    Bitmap old = barBitmap;
+                    barBitmap = cut;
+                    barBitmapKey = key;
+                    updateOverlay();
+                    if (old != null && old != cut) old.recycle();
+                }
+
+                @Override
+                public void onFailure(int errorCode) {
+                    captureInFlight = false;
+                    if (Prefs.on(prefs, Prefs.DIAG)) DiagLog.add("Snímka lišty zlyhala: " + errorCode);
+                }
+            });
+        } catch (RuntimeException ex) {
+            captureInFlight = false;
+            DiagLog.add("Snímka lišty nedostupná: " + ex);
+        }
+    }
+
+    /** Kým je prekrytie zobrazené, občas obnoví obraz lišty (odznaky správ a pod.). */
+    private void startPeriodic() {
+        if (periodicRunning) return;
+        periodicRunning = true;
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (overlay == null) {
+                    periodicRunning = false;
+                    return;
+                }
+                scheduleOverlayUpdate();
+                handler.postDelayed(this, 2000);
+            }
+        }, 2000);
+    }
+
+    // ---------------------------------------------------------------------
+    //  Okno prekrytia
+    // ---------------------------------------------------------------------
+
+    private void placeOverlay(Rect r) {
         if (overlay == null) {
-            overlay = new View(this);
-            overlay.setClickable(true); // zje ťuknutia, aby sa karta nedala otvoriť
+            overlay = new BarView(this, new BarView.Listener() {
+                @Override
+                public void onTap(int index) {
+                    clickTarget(index, AccessibilityNodeInfo.ACTION_CLICK);
+                }
+
+                @Override
+                public void onLongPress(int index) {
+                    clickTarget(index, AccessibilityNodeInfo.ACTION_LONG_CLICK);
+                }
+            });
             overlayLp = new WindowManager.LayoutParams(
                     r.width(), r.height(),
                     WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
@@ -269,28 +494,23 @@ public class BlockerService extends AccessibilityService {
             overlayLp.gravity = Gravity.TOP | Gravity.START;
             overlayLp.x = r.left;
             overlayLp.y = r.top;
-            overlay.setBackgroundColor(color);
             try {
                 wm.addView(overlay, overlayLp);
             } catch (RuntimeException ex) {
-                overlay = null;
                 DiagLog.add("Chyba prekrytia: " + ex);
-                return;
             }
-        } else {
-            overlay.setBackgroundColor(color);
-            if (overlayLp.x != r.left || overlayLp.y != r.top
-                    || overlayLp.width != r.width() || overlayLp.height != r.height()) {
-                overlayLp.x = r.left;
-                overlayLp.y = r.top;
-                overlayLp.width = r.width();
-                overlayLp.height = r.height();
-                try {
-                    wm.updateViewLayout(overlay, overlayLp);
-                } catch (RuntimeException ignored) {}
-            }
+            return;
         }
-        overlayPkg = pkg;
+        if (overlayLp.x != r.left || overlayLp.y != r.top
+                || overlayLp.width != r.width() || overlayLp.height != r.height()) {
+            overlayLp.x = r.left;
+            overlayLp.y = r.top;
+            overlayLp.width = r.width();
+            overlayLp.height = r.height();
+            try {
+                wm.updateViewLayout(overlay, overlayLp);
+            } catch (RuntimeException ignored) {}
+        }
     }
 
     private void hideOverlay() {
@@ -299,12 +519,12 @@ public class BlockerService extends AccessibilityService {
                 wm.removeView(overlay);
             } catch (RuntimeException ignored) {}
             overlay = null;
-            overlayPkg = null;
         }
+        barTargets = Collections.emptyList();
     }
 
     // =====================================================================
-    //  Farba lišty — zistí sa zo snímky obrazovky vedľa ikony (Android 11+)
+    //  Farba lišty pre jednoduchý režim — zo snímky obrazovky vedľa ikony
     // =====================================================================
 
     private int colorFor(String pkg, Rect r) {
@@ -326,7 +546,7 @@ public class BlockerService extends AccessibilityService {
     private void sampleColor(String key, Rect r) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return;
         lastScreenshot = SystemClock.uptimeMillis();
-        int screenW = getResources().getDisplayMetrics().widthPixels;
+        int screenW = screenWidth();
         // bod tesne vedľa ikony (mimo nášho obdĺžnika), v strede výšky lišty
         final int x = r.left > 6 ? r.left - 4 : Math.min(r.right + 4, screenW - 1);
         final int y = r.centerY();
@@ -339,16 +559,18 @@ public class BlockerService extends AccessibilityService {
                         if (hw == null) return;
                         Bitmap sw = hw.copy(Bitmap.Config.ARGB_8888, false);
                         hw.recycle();
-                        result.getHardwareBuffer().close();
                         if (sw == null) return;
                         if (x >= 0 && y >= 0 && x < sw.getWidth() && y < sw.getHeight()) {
                             int color = sw.getPixel(x, y) | 0xFF000000;
                             sampledColors.put(key, color);
                             sampledAt.put(key, SystemClock.uptimeMillis());
-                            if (overlay != null) overlay.setBackgroundColor(color);
+                            if (overlay != null && !overlay.isBarMode()) overlay.showSolid(color);
                         }
                         sw.recycle();
-                    } catch (RuntimeException ignored) {}
+                    } catch (RuntimeException ignored) {
+                    } finally {
+                        result.getHardwareBuffer().close();
+                    }
                 }
 
                 @Override
@@ -366,6 +588,15 @@ public class BlockerService extends AccessibilityService {
         DisplayMetrics dm = new DisplayMetrics();
         wm.getDefaultDisplay().getRealMetrics(dm);
         return dm.heightPixels;
+    }
+
+    private int screenWidth() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return wm.getCurrentWindowMetrics().getBounds().width();
+        }
+        DisplayMetrics dm = new DisplayMetrics();
+        wm.getDefaultDisplay().getRealMetrics(dm);
+        return dm.widthPixels;
     }
 
     private void diagTab(String msg) {
