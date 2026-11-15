@@ -64,6 +64,12 @@ public class MainActivity extends Activity {
         col.addView(toggle("Skryť kartu Shorts v YouTube", Prefs.YT_TAB));
         col.addView(toggle("Pri poslanom reeli/shorte zakázať posun na ďalší", Prefs.BLOCK_SCROLL));
 
+        col.addView(text("\nAk lišta vyzerá zle (staré ikony, zlá farba), nechaj ju načítať nanovo:"));
+        col.addView(button("Načítať vzhľad lišty nanovo", v -> {
+            BlockerService.clearCache(this);
+            Toast.makeText(this, "Hotovo — otvor Instagram/YouTube", Toast.LENGTH_SHORT).show();
+        }));
+
         col.addView(text("\nAk po aktualizácii Instagramu/YouTube niečo prestane fungovať, "
                 + "zapni diagnostiku, choď do appky, otvor reel a skús ho posunúť, "
                 + "potom sa vráť sem a skopíruj záznam."));
