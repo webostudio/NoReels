@@ -19,7 +19,14 @@ final class BarView extends View {
     interface Listener {
         void onTap(int index);
         void onLongPress(int index);
+        void onExitDone();
     }
+
+    private static final int NONE = 0, EXIT = 1, ENTER = 2;
+    private final Listener listener;
+    private int slide;      // lišta appky je posunutá doprava o toľko px (swipe na kameru)
+    private int anim = NONE; // prechod na inú obrazovku appky (chat) a späť
+    private long animStart;
 
     private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final GestureDetector gestures;
@@ -31,6 +38,7 @@ final class BarView extends View {
 
     BarView(Context c, Listener listener) {
         super(c);
+        this.listener = listener;
         gestures = new GestureDetector(c, new GestureDetector.SimpleOnGestureListener() {
             @Override
             public boolean onDown(MotionEvent e) {
@@ -64,6 +72,31 @@ final class BarView extends View {
         invalidate();
     }
 
+    /** Lišta appky sa posúva do strany (swipe na kameru) — kresliť posunuté rovnako. */
+    void setSlide(int px) {
+        if (px == slide) return;
+        slide = px;
+        invalidate();
+    }
+
+    /** Appka otvára ďalšiu obrazovku, ktorá sa zasúva sprava cez lištu. */
+    void animateExit() {
+        anim = EXIT;
+        animStart = android.os.SystemClock.uptimeMillis();
+        invalidate();
+    }
+
+    /** Appka sa vracia na obrazovku s lištou (tá predošlá odchádza doprava). */
+    void animateEnter() {
+        anim = ENTER;
+        animStart = android.os.SystemClock.uptimeMillis() - 60; // udalosť o návrate chodí asi o 60 ms neskôr, než animácia začne
+        invalidate();
+    }
+
+    boolean isAnimating() {
+        return anim != NONE;
+    }
+
     boolean isBarMode() {
         return icons != null;
     }
@@ -76,8 +109,38 @@ final class BarView extends View {
 
     @Override
     protected void onDraw(Canvas canvas) {
+        int w = getWidth();
+        float shift = slide;
+        if (slide > 0) canvas.clipRect(slide, 0, w, getHeight());
+        if (anim != NONE) {
+            // napodobenie prechodu Instagramu: nová obrazovka sa zasúva sprava (rýchly dobeh),
+            // obrazovka s lištou sa pritom posunie kúsok doľava
+            float t = android.os.SystemClock.uptimeMillis() - animStart;
+            float k = (float) Math.exp(-t / 48f);
+            float edge;
+            if (anim == EXIT) {
+                edge = w * k;
+                shift = -0.12f * w * (1f - (float) Math.exp(-t / 28f));
+                if (t > 230) {
+                    anim = NONE;
+                    post(listener::onExitDone);
+                    return;
+                }
+            } else {
+                edge = w * (1f - k);
+                shift = -0.12f * w * (float) Math.exp(-t / 85f);
+                if (t > 380) {
+                    anim = NONE;
+                    edge = w;
+                    shift = 0;
+                }
+            }
+            canvas.clipRect(0, 0, edge, getHeight());
+            if (anim != NONE) postInvalidateOnAnimation();
+        }
         canvas.drawColor(solid);
         if (icons == null) return;
+        canvas.translate(Math.round(shift), 0);
         // pozadie lišty: okrajový stĺpec posledného tlačidla roztiahnutý na celú šírku
         // (zachová aj deliacu čiaru nad lištou)
         Bitmap edge = icons[icons.length - 1];
@@ -97,7 +160,7 @@ final class BarView extends View {
 
     @Override
     public boolean onTouchEvent(MotionEvent e) {
-        if (icons == null) return true; // jednoduchý režim: len zjesť ťuknutie
+        if (icons == null || anim != NONE || slide != 0) return true; // len zjesť ťuknutie
         gestures.onTouchEvent(e);
         return true;
     }

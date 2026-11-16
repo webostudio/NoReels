@@ -149,6 +149,19 @@ public class BlockerService extends AccessibilityService {
     };
     private long lastSkip;
 
+    // --- lišta Instagramu sa posúva do strany (swipe na kameru) ---
+    private android.os.HandlerThread trackWorker;
+    private Handler track;
+    private volatile AccessibilityNodeInfo igBarNode; // celá lišta kariet
+    private volatile long trackUntil;
+    private volatile boolean tracking;
+    private int slideOff;            // posledný známy posun lišty (hlavné vlákno)
+    private volatile boolean modalHidden; // lištu práve prekryla ďalšia obrazovka Instagramu (chat)
+    private volatile long modalHiddenAt;
+    private long modalAnimUntil;
+    private long barNullSince;
+    private int barWinId = -1;       // okno Instagramu, v ktorom je lišta
+
     // --- blokovanie posúvania v prehrávači ---
     private int pagerKey;
     private int baseIndex = -1;
@@ -164,9 +177,35 @@ public class BlockerService extends AccessibilityService {
     // --- diagnostika ---
     private String lastDiagTab = "";
 
+    private volatile long dbgPollUntil;
     private final BroadcastReceiver debugReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context c, Intent i) {
+            if ("sk.noreels.DBG_POLL".equals(i.getAction())) {
+                dbgPollUntil = SystemClock.uptimeMillis() + i.getIntExtra("ms", 4000);
+                hideOverlay();
+                bg.post(() -> {
+                    try {
+                        AccessibilityNodeInfo root = getRootInActiveWindow();
+                        List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByViewId(IG + ":id/tab_bar");
+                        AccessibilityNodeInfo bar = l.isEmpty() ? null : l.get(0);
+                        List<AccessibilityNodeInfo> l2 = root.findAccessibilityNodeInfosByViewId(IG + ":id/clips_tab");
+                        AccessibilityNodeInfo tab = l2.isEmpty() ? null : l2.get(0);
+                        Rect a = new Rect(), b = new Rect();
+                        String last = "";
+                        while (SystemClock.uptimeMillis() < dbgPollUntil) {
+                            boolean ra = bar != null && bar.refresh(), rb = tab != null && tab.refresh();
+                            if (ra) bar.getBoundsInScreen(a);
+                            if (rb) tab.getBoundsInScreen(b);
+                            String now = "POLL bar=" + ra + a.toShortString() + (ra && bar.isVisibleToUser() ? "V" : "-") + " tab=" + rb + b.toShortString() + (rb && tab.isVisibleToUser() ? "V" : "-");
+                            if (!now.equals(last)) Log.d(TAG, now);
+                            last = now;
+                            SystemClock.sleep(8);
+                        }
+                    } catch (RuntimeException ex) { Log.d(TAG, "POLL err " + ex); }
+                });
+                return;
+            }
             Path p = new Path();
             p.moveTo(i.getIntExtra("x1", 900), i.getIntExtra("y1", 1200));
             p.lineTo(i.getIntExtra("x2", 150), i.getIntExtra("y2", 1200));
@@ -186,7 +225,11 @@ public class BlockerService extends AccessibilityService {
         fastWorker = new android.os.HandlerThread("noreels-skip");
         fastWorker.start();
         fast = new Handler(fastWorker.getLooper());
+        trackWorker = new android.os.HandlerThread("noreels-track");
+        trackWorker.start();
+        track = new Handler(trackWorker.getLooper());
         if (DEBUG) registerReceiver(debugReceiver, new IntentFilter("sk.noreels.DBG_SWIPE"));
+        if (DEBUG) registerReceiver(debugReceiver, new IntentFilter("sk.noreels.DBG_POLL"));
         DiagLog.add("Služba spustená (Android API " + Build.VERSION.SDK_INT + ")");
     }
 
@@ -201,6 +244,7 @@ public class BlockerService extends AccessibilityService {
         hideOverlay();
         if (worker != null) worker.quitSafely();
         if (fastWorker != null) fastWorker.quitSafely();
+        if (trackWorker != null) trackWorker.quitSafely();
         super.onDestroy();
     }
 
@@ -218,6 +262,24 @@ public class BlockerService extends AccessibilityService {
             Log.d(TAG, "EV " + AccessibilityEvent.eventTypeToString(type) + " cls=" + e.getClassName()
                     + " desc=" + e.getContentDescription() + " txt=" + e.getText()
                     + " from=" + e.getFromIndex() + " dx=" + e.getScrollDeltaX() + " sx=" + e.getScrollX());
+        }
+        if (DEBUG && type == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            StringBuilder sb = new StringBuilder("WINCH ch=" + e.getWindowChanges() + " :");
+            try {
+                for (AccessibilityWindowInfo w : getWindows()) {
+                    Rect b = new Rect(); w.getBoundsInScreen(b);
+                    sb.append(" [t").append(w.getType()).append(" id").append(w.getId()).append(' ').append(w.getTitle()).append(w.isFocused() ? " F" : "").append(w.isActive() ? " A" : "").append(' ').append(b.toShortString()).append(']');
+                }
+            } catch (RuntimeException ignored) {}
+            Log.d(TAG, sb.toString());
+        }
+        if (DEBUG && target && type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            Log.d(TAG, "WCC win=" + e.getWindowId() + " cls=" + e.getClassName() + " ct=" + e.getContentChangeTypes());
+        }
+        if (IG.equals(pkg) && igBarNode != null && (type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+                || type == AccessibilityEvent.TYPE_VIEW_SCROLLED) && Prefs.on(prefs, Prefs.IG_TAB)
+                && SystemClock.uptimeMillis() - lastPagerDxAt > 800) { // nie počas swipu medzi kartami
+            startTracking(700);
         }
         if (type == AccessibilityEvent.TYPE_VIEW_CLICKED) {
             if (YT.equals(pkg)) {
@@ -302,8 +364,10 @@ public class BlockerService extends AccessibilityService {
         }
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             String cls = e.getClassName() == null ? "" : e.getClassName().toString();
+            if (DEBUG) Log.d(TAG, "WSC pkg=" + pkg + " cls=" + cls);
             if (target) {
                 resetPager(); // nová obrazovka => nový prehrávač začína odznova
+                if (IG.equals(pkg)) onIgActivity(cls);
                 onTargetWindow(pkg, cls);
                 if (YT.equals(pkg) && !YT.equals(lastStatePkg) && !ytPlayerOpen) ytFrontAt = SystemClock.uptimeMillis();
                 lastStatePkg = pkg;
@@ -350,6 +414,137 @@ public class BlockerService extends AccessibilityService {
                 }
             }
         } catch (RuntimeException ignored) {}
+    }
+
+    /**
+     * Instagram otvára ďalšiu obrazovku (chat) alebo sa z nej vracia. Lišta sa pri tom posúva spolu
+     * s animáciou appky — nečaká sa, kým animácia skončí.
+     */
+    private void onIgActivity(String cls) {
+        long now = SystemClock.uptimeMillis();
+        if (cls.endsWith(".ModalActivity")) {
+            if (DEBUG) Log.d(TAG, "IG modal: ov=" + (overlay != null) + " bar=" + (overlay != null && overlay.isBarMode()) + " pkg=" + overlayPkg + " slide=" + slideOff + " anim=" + (overlay != null && overlay.isAnimating()));
+            if (overlay != null && overlay.isBarMode() && IG.equals(overlayPkg) && slideOff == 0
+                    && !overlay.isAnimating()) {
+                modalAnimUntil = now + 400;
+                overlay.animateExit();
+            }
+        } else if (cls.endsWith(".InstagramMainActivity")) {
+            if (DEBUG) Log.d(TAG, "IG main: modalHidden=" + modalHidden + " ov=" + (overlay != null));
+            Shown last = lastShown.get(IG);
+            if (overlay == null && modalHidden && last != null && Prefs.on(prefs, Prefs.IG_TAB)) {
+                placeOverlay(last.rect, IG);
+                if (overlay != null) {
+                    overlay.showBar(last.icons, last.bg);
+                    overlay.animateEnter();
+                    barTargets = Collections.emptyList();
+                    graceUntil = now + 900;
+                    preShownAt = now;
+                    updateLater(150);
+                }
+            }
+            modalHidden = false;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    //  Sledovanie posunu lišty (swipe na kameru a späť)
+    // ---------------------------------------------------------------------
+
+    private void startTracking(long ms) {
+        trackUntil = SystemClock.uptimeMillis() + ms;
+        if (tracking || track == null) return;
+        tracking = true;
+        track.post(trackLoop);
+    }
+
+    private int trackLast = -1, trackPrev = -1;
+    private long trackPrevAt;
+    private final Rect trackRect = new Rect();
+    private final Runnable trackLoop = new Runnable() {
+        @Override
+        public void run() {
+            long now = SystemClock.uptimeMillis();
+            final AccessibilityNodeInfo node = igBarNode;
+            int w = screenWidth();
+            int off = -1;
+            try {
+                if (node != null && node.refresh()) {
+                    node.getBoundsInScreen(trackRect);
+                    if (trackRect.left >= w) off = w;
+                    else if (node.isVisibleToUser()) off = Math.max(0, trackRect.left);
+                    else off = -2; // prekrytá inou obrazovkou — nie je odsunutá
+                }
+            } catch (RuntimeException ignored) {}
+            if (off == -2) {
+                if (now > trackUntil) {
+                    tracking = false;
+                    return;
+                }
+                track.postDelayed(this, 45);
+                return;
+            }
+            if (off < 0) { // lišta už neexistuje
+                igBarNode = null;
+                tracking = false;
+                trackLast = -1;
+                handler.post(() -> {
+                    if (slideOff > 0 && slideOff < screenWidth()) {
+                        slideOff = 0;
+                        if (overlay != null) overlay.setSlide(0);
+                        requestUpdate(true);
+                    }
+                });
+                return;
+            }
+            boolean moving = off > 0 && off < w;
+            if (off != trackLast) {
+                // kreslenie mešká asi o snímku za appkou — odhadnúť, kde lišta bude
+                int shown = off;
+                long dt = now - trackPrevAt;
+                if (moving && trackPrev > 0 && trackPrev < w && dt >= 8 && dt < 45) {
+                    float v = Math.max(-4f, Math.min(4f, (off - trackPrev) / (float) dt));
+                    shown = Math.max(1, Math.min(w - 1, Math.round(off + v * 14f)));
+                }
+                final int s = shown, raw = off;
+                if (DEBUG) Log.d(TAG, "TRACK off=" + off + " shown=" + s);
+                handler.post(() -> setSlide(s));
+                trackLast = off;
+                trackPrev = off;
+                trackPrevAt = now;
+            }
+            if (!moving && (now > trackUntil || now - lastPagerDxAt < 800)) {
+                tracking = false;
+                return;
+            }
+            track.postDelayed(this, moving ? 6 : 45);
+        }
+    };
+
+    /** Hlavné vlákno: lišta Instagramu je posunutá o {@code off} px doprava (šírka obrazovky = preč). */
+    private void setSlide(int off) {
+        int w = screenWidth();
+        boolean was = slideOff > 0;
+        slideOff = Math.min(off, w);
+        if (!Prefs.on(prefs, Prefs.IG_TAB)) return;
+        if (off >= w) {
+            if (overlay != null && IG.equals(overlayPkg)) hideOverlay();
+            return;
+        }
+        if (off > 0) {
+            if (overlay == null) {
+                Shown last = lastShown.get(IG);
+                if (last == null) return;
+                placeOverlay(last.rect, IG);
+                if (overlay == null) return;
+                overlay.showBar(last.icons, last.bg);
+                barTargets = Collections.emptyList();
+            }
+            if (IG.equals(overlayPkg)) overlay.setSlide(off);
+            return;
+        }
+        if (overlay != null) overlay.setSlide(0);
+        if (was) requestUpdate(true);
     }
 
     /** Hlavná obrazovka appky je otvorená — ak sa lišta do chvíle neobjaví, nie je tu. */
@@ -538,6 +733,11 @@ public class BlockerService extends AccessibilityService {
     /** Zistí stav appky na pracovnom vlákne a výsledok použije na hlavnom. */
     private void updateOverlay() {
         lastUpdate = SystemClock.uptimeMillis();
+        if (slideOff > 0 && slideOff < screenWidth()) { // lišta sa práve posúva — nezaťažovať appku dopytmi
+            startTracking(700);
+            return;
+        }
+        if (DEBUG && lastUpdate < dbgPollUntil) return;
         if (queryRunning) {
             queryAgain = true;
             return;
@@ -561,7 +761,8 @@ public class BlockerService extends AccessibilityService {
         AccessibilityWindowInfo win;
         String pkg, seenPkg;
         final Rect tabRect = new Rect();
-        boolean misplaced, usable, tabSelected, ytPlayer;
+        boolean misplaced, usable, tabSelected, ytPlayer, sliding;
+        int seenWinId = -1;
         final List<Integer> ytItems = new ArrayList<>();
         Bar bar;
     }
@@ -576,7 +777,15 @@ public class BlockerService extends AccessibilityService {
                 String p = r.getPackageName().toString();
                 if (IG.equals(p) && Prefs.on(prefs, Prefs.IG_TAB)) {
                     q.seenPkg = p;
+                    if (q.seenWinId == -1) q.seenWinId = w.getId();
                     q.tab = findIgTab(r);
+                    for (AccessibilityNodeInfo n : r.findAccessibilityNodeInfosByViewId(IG + ":id/tab_bar")) {
+                        igBarNode = n;
+                        Rect br = new Rect();
+                        n.getBoundsInScreen(br);
+                        if (br.left > 0) q.sliding = true;
+                        break;
+                    }
                 } else if (YT.equals(p) && Prefs.on(prefs, Prefs.YT_TAB)) {
                     q.seenPkg = p;
                     q.tab = findYtTab(r);
@@ -636,7 +845,31 @@ public class BlockerService extends AccessibilityService {
             ytMisses++;
         }
         targetVisible = seenPkg != null;
+        if (DEBUG) Log.d(TAG, "Q seen=" + seenPkg + " usable=" + q.usable + " tab=" + (tab != null) + " rect=" + tabRect.toShortString() + " vis=" + (tab != null && tab.isVisibleToUser()) + " ov=" + (overlay != null));
         checkYtPlayer(q.ytPlayer, q.ytItems, now);
+        if (DEBUG && seenPkg == null && modalHidden) Log.d(TAG, "IG not seen while modalHidden");
+
+        // lišta Instagramu je práve posunutá do strany (kamera) — stará sa o ňu sledovanie posunu
+        if (q.sliding || slideOff > 0) {
+            startTracking(700);
+            if (q.sliding || q.usable) return;
+        }
+        // Instagram práve otvoril ďalšiu obrazovku v novom okne (chat) — udalosť o nej ešte nemusela
+        // prísť; lišta odíde spolu s animáciou
+        if (!q.usable && tab == null && IG.equals(seenPkg) && barWinId != -1 && q.seenWinId != barWinId
+                && overlay != null && overlay.isBarMode() && IG.equals(overlayPkg)
+                && !overlay.isAnimating() && slideOff == 0 && now > modalAnimUntil) {
+            modalAnimUntil = now + 500;
+            handler.postDelayed(() -> {
+                if (overlay != null && !overlay.isAnimating() && SystemClock.uptimeMillis() < modalAnimUntil) {
+                    overlay.animateExit();
+                }
+            }, 110);
+        }
+        if (overlay != null && now < modalAnimUntil) {
+            updateLater(120);
+            return;
+        }
 
         if (!q.usable) {
             boolean targetInFront = seenPkg != null || IG.equals(lastStatePkg) || YT.equals(lastStatePkg)
@@ -660,6 +893,11 @@ public class BlockerService extends AccessibilityService {
                 return;
             }
             if (seenPkg != null && tab == null) hadBar.put(seenPkg, false); // appka je otvorená, ale bez lišty
+            // lištu prekryla ďalšia obrazovka Instagramu v novom okne => pri návrate ju ukázať hneď
+            if (overlay != null && tab == null && IG.equals(seenPkg) && barWinId != -1 && q.seenWinId != barWinId) {
+                modalHidden = true;
+                modalHiddenAt = now;
+            }
             diagTab("karta nenájdená");
             insideSince = 0;
             hideOverlay();
@@ -667,6 +905,7 @@ public class BlockerService extends AccessibilityService {
         }
         graceUntil = 0;
         hadBar.put(pkg, true);
+        if (IG.equals(pkg)) barWinId = win.getId();
         if (IG.equals(pkg) && tab.getContentDescription() != null) {
             reelsDesc = tab.getContentDescription().toString();
         }
@@ -700,10 +939,17 @@ public class BlockerService extends AccessibilityService {
         int bg = prefs.getInt("bg4|" + theme, bgDefault);
 
         if (bar == null) {
+            // lišta sa práve prekresľuje (prechod na inú obrazovku) — chvíľu nechať, čo je nakreslené
+            if (barNullSince == 0) barNullSince = now;
+            if (overlay != null && overlay.isBarMode() && pkg.equals(overlayPkg) && now - barNullSince < 500) {
+                updateLater(120);
+                return;
+            }
             placeOverlay(tabRect, pkg);
             setSolid(bg);
             return;
         }
+        barNullSince = 0;
 
         // stav lišty = geometria + vzhľad každého tlačidla
         String[] keys = new String[bar.tabs.size()];
@@ -767,13 +1013,12 @@ public class BlockerService extends AccessibilityService {
         if (all && (exact || !canLearn || settling)) {
             placeOverlay(bar.rect, pkg);
             overlay.showBar(icons, bg);
-            if (exact) {
-                Shown s = new Shown();
-                s.rect = new Rect(bar.rect);
-                s.icons = icons;
-                s.bg = bg;
-                lastShown.put(pkg, s);
-            } else if (canLearn) {
+            Shown s = new Shown();
+            s.rect = new Rect(bar.rect);
+            s.icons = icons;
+            s.bg = bg;
+            lastShown.put(pkg, s);
+            if (!exact && canLearn) {
                 updateLater(150); // po ustálení sa doučí presný vzhľad
             }
         } else if (!canLearn) {
@@ -791,6 +1036,11 @@ public class BlockerService extends AccessibilityService {
     }
 
     private void setSolid(int color) {
+        if (overlay != null && overlay.isAnimating()) { // počas prechodu lištu nemeniť
+            updateLater(150);
+            return;
+        }
+        if (DEBUG && overlay != null && overlay.isBarMode()) Log.d(TAG, "SOLID by " + new Throwable().getStackTrace()[1].getLineNumber());
         if (overlay == null) return;
         if (overlay.isBarMode()) solidSince = SystemClock.uptimeMillis();
         overlay.showSolid(color);
@@ -1326,6 +1576,15 @@ public class BlockerService extends AccessibilityService {
                 public void onLongPress(int index) {
                     clickTarget(index, AccessibilityNodeInfo.ACTION_LONG_CLICK);
                 }
+
+                @Override
+                public void onExitDone() {
+                    modalAnimUntil = 0;
+                    hideOverlay();
+                    modalHidden = true;
+                    modalHiddenAt = SystemClock.uptimeMillis();
+                    startTracking(700);
+                }
             });
             overlayLp = new WindowManager.LayoutParams(
                     r.width(), r.height(),
@@ -1339,11 +1598,13 @@ public class BlockerService extends AccessibilityService {
             overlayLp.x = r.left;
             overlayLp.y = r.top;
             solidSince = SystemClock.uptimeMillis();
+            if (DEBUG) Log.d(TAG, "SHOW overlay " + r.toShortString());
             boolean opening = SystemClock.uptimeMillis() - appearedAt < 700;
             if (opening) overlay.setAlpha(0f);
             try {
                 wm.addView(overlay, overlayLp);
-                if (opening) overlay.animate().alpha(1f).setDuration(200).start();
+                // appka sa ešte len roztvára z ikony — lišta nabehne, až keď je okno skoro na mieste
+                if (opening) overlay.animate().alpha(1f).setStartDelay(130).setDuration(80).start();
             } catch (RuntimeException ex) {
                 overlay = null;
                 DiagLog.add("Chyba prekrytia: " + ex);
@@ -1424,6 +1685,7 @@ public class BlockerService extends AccessibilityService {
 
     private void hideOverlay() {
         removeCurtain();
+        if (DEBUG && overlay != null) Log.d(TAG, "HIDE overlay by " + new Throwable().getStackTrace()[1].getMethodName() + " anim=" + overlay.isAnimating() + " mh=" + modalHidden);
         if (overlay != null) lastHideAt = SystemClock.uptimeMillis();
         if (overlay != null) {
             try {
